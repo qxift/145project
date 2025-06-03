@@ -186,6 +186,7 @@ class DecisionTreeRecommender(MyRecommender):
         recs_pd = recs.toPandas()
         X_pred = recs_pd.drop(columns=["user_idx", "item_idx"])
         X_pred = pd.get_dummies(X_pred)
+        X_pred = X_pred.loc[:, ~X_pred.columns.duplicated()]
         X_pred = X_pred.reindex(columns=self.feature_names, fill_value=0)
 
         recs_pd["relevance"] = self.model.predict_proba(X_pred)[:, 1]
@@ -508,7 +509,7 @@ def run_recommender_analysis():
         MyRecommender(seed=42),  # Add your custom recommender here
         DecisionTreeRecommender(seed=42)  
     ]
-    recommender_names = ["Random", "Popularity", "ContentBased", "MyRecommender"]
+    recommender_names = ["Random", "Popularity", "ContentBased", "MyRecommender", "DecisionTreeRecommender"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:

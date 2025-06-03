@@ -144,61 +144,93 @@ class MyRecommender:
         return recs
 
 
-class DecisionTreeRecommender(MyRecommender):
-    def __init__(self, seed=None, max_depth=5):
-        super().__init__(seed)
+from sklearn.tree import DecisionTreeClassifier
+import pandas as pd
+
+class DecisionTreeRecommender:
+    def __init__(self, seed=None, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0):
+        self.seed = seed
         self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.min_samples_split = min_samples_split
+        self.ccp_alpha = ccp_alpha
         self.model = None
         self.user_features = None
         self.item_features = None
+        self.feature_names = None
 
     def fit(self, log, user_features=None, item_features=None):
         self.user_features = user_features
         self.item_features = item_features
 
-        # Join log with user/item features
         df = (
             log.join(user_features, on="user_idx")
                .join(item_features, on="item_idx")
                .toPandas()
         )
 
+        # Drop duplicated columns, just in case
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        # Extract features and labels
         X = df.drop(columns=["user_idx", "item_idx", "relevance"])
+        X = pd.get_dummies(X)
+        X = X.loc[:, ~X.columns.duplicated()]
         y = df["relevance"].astype(int)
 
-        X = pd.get_dummies(X)
-        self.model = DecisionTreeClassifier(max_depth=self.max_depth, random_state=self.seed)
+        self.model = DecisionTreeClassifier(
+            max_depth=self.max_depth,
+            min_samples_leaf=self.min_samples_leaf,
+            min_samples_split=self.min_samples_split,
+            ccp_alpha=self.ccp_alpha,
+            random_state=self.seed
+        )
         self.model.fit(X, y)
-
         self.feature_names = self.model.feature_names_in_
 
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         user_feats = user_features or self.user_features
         item_feats = item_features or self.item_features
 
+        # Cross join users and items
         recs = users.crossJoin(items)
         recs = recs.join(user_feats, on="user_idx").join(item_feats, on="item_idx")
 
+        # Remove already seen items
         if filter_seen_items and log is not None:
             seen = log.select("user_idx", "item_idx")
             recs = recs.join(seen, on=["user_idx", "item_idx"], how="left_anti")
 
+        # Convert to pandas
         recs_pd = recs.toPandas()
-        X_pred = recs_pd.drop(columns=["user_idx", "item_idx"])
+        recs_pd = recs_pd.loc[:, ~recs_pd.columns.duplicated()]
+
+        # Handle price safely
+        if "price" not in recs_pd.columns:
+            price_cols = [col for col in recs_pd.columns if "price" in col.lower()]
+            if not price_cols:
+                raise ValueError("No price column found in prediction dataframe.")
+            recs_pd["price"] = recs_pd[price_cols[0]]
+
+        recs_pd["price"] = pd.to_numeric(recs_pd["price"], errors="coerce").fillna(0.0)
+
+        # Prepare features
+        X_pred = recs_pd.drop(columns=["user_idx", "item_idx", "price"])
         X_pred = pd.get_dummies(X_pred)
         X_pred = X_pred.loc[:, ~X_pred.columns.duplicated()]
         X_pred = X_pred.reindex(columns=self.feature_names, fill_value=0)
 
+        # Predict
         recs_pd["relevance"] = self.model.predict_proba(X_pred)[:, 1]
+        recs_pd["revenue_score"] = recs_pd["relevance"] * recs_pd["price"]
+        recs_pd["rank"] = recs_pd.groupby("user_idx")["revenue_score"].rank(ascending=False, method="first")
 
-        # Rank and return top-k
-        recs_pd["rank"] = recs_pd.groupby("user_idx")["relevance"].rank(ascending=False, method="first")
         topk = recs_pd[recs_pd["rank"] <= k][["user_idx", "item_idx", "relevance"]]
 
         from pyspark.sql import SparkSession
         spark = SparkSession.getActiveSession()
         return spark.createDataFrame(topk)
-
+    
 # Cell: Data Exploration Functions
 """
 ## Data Exploration Functions
@@ -509,7 +541,9 @@ def run_recommender_analysis():
         MyRecommender(seed=42),  # Add your custom recommender here
         DecisionTreeRecommender(seed=42)  
     ]
-    recommender_names = ["Random", "Popularity", "ContentBased", "MyRecommender", "DecisionTreeRecommender"]
+    recommender_names = [
+        "Random", "Popularity", "ContentBased", "MyRecommender", 
+        "DecisionTreeRecommender"]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:

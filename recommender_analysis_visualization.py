@@ -192,20 +192,18 @@ class DecisionTreeRecommender:
         user_feats = user_features or self.user_features
         item_feats = item_features or self.item_features
 
-        # Cross join users and items
         recs = users.crossJoin(items)
         recs = recs.join(user_feats, on="user_idx").join(item_feats, on="item_idx")
 
-        # Remove already seen items
         if filter_seen_items and log is not None:
             seen = log.select("user_idx", "item_idx")
             recs = recs.join(seen, on=["user_idx", "item_idx"], how="left_anti")
 
-        # Convert to pandas
+
         recs_pd = recs.toPandas()
         recs_pd = recs_pd.loc[:, ~recs_pd.columns.duplicated()]
 
-        # Handle price safely
+
         if "price" not in recs_pd.columns:
             price_cols = [col for col in recs_pd.columns if "price" in col.lower()]
             if not price_cols:
@@ -214,13 +212,11 @@ class DecisionTreeRecommender:
 
         recs_pd["price"] = pd.to_numeric(recs_pd["price"], errors="coerce").fillna(0.0)
 
-        # Prepare features
         X_pred = recs_pd.drop(columns=["user_idx", "item_idx", "price"])
         X_pred = pd.get_dummies(X_pred)
         X_pred = X_pred.loc[:, ~X_pred.columns.duplicated()]
         X_pred = X_pred.reindex(columns=self.feature_names, fill_value=0)
 
-        # Predict
         recs_pd["relevance"] = self.model.predict_proba(X_pred)[:, 1]
         recs_pd["revenue_score"] = recs_pd["relevance"] * recs_pd["price"]
         recs_pd["rank"] = recs_pd.groupby("user_idx")["revenue_score"].rank(ascending=False, method="first")
@@ -539,11 +535,12 @@ def run_recommender_analysis():
         PopularityRecommender(alpha=1.0, seed=42),
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
         MyRecommender(seed=42),  # Add your custom recommender here
-        DecisionTreeRecommender(seed=42)  
-    ]
+        DecisionTreeRecommender(seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0),
+    ] 
     recommender_names = [
         "Random", "Popularity", "ContentBased", "MyRecommender", 
-        "DecisionTreeRecommender"]
+        "DecisionTree"
+    ]
     
     # Initialize recommenders with initial history
     for recommender in recommenders:

@@ -226,6 +226,86 @@ class DecisionTreeRecommender:
         from pyspark.sql import SparkSession
         spark = SparkSession.getActiveSession()
         return spark.createDataFrame(topk)
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sim4rec.utils import pandas_to_spark
+class LogisticRegressionRecommender:
+    def __init__(self, seed=None):
+        self.seed = seed
+        np.random.seed(seed)
+        self.model = LogisticRegression(
+            random_state=self.seed, 
+            max_iter=1500, 
+            solver='saga',
+            C=1
+        )
+        self.scaler = StandardScaler()
+        self.user_feats = None
+        self.item_feats = None
+
+    def fit(self, log:DataFrame, user_features=None, item_features=None):
+        # Create training dataframe
+        if user_features and item_features:
+            df = log.join(
+                user_features, 
+                on='user_idx'
+            ).join(
+                item_features, 
+                on='item_idx'
+            ).drop(
+                'user_idx', 'item_idx', '__iter'
+            ).toPandas()
+            
+            # Scale price
+            df = pd.get_dummies(df, dtype=float)
+            df['price'] = self.scaler.fit_transform(df[['price']])
+            
+            # Split X and y
+            X = df.drop(['relevance'], axis=1)
+            y = df['relevance']
+            
+            # Fit model to data
+            self.model.fit(X,y)
+            
+            # Store features
+            self.user_feats = user_features
+            self.item_feats = item_features
+            
+    def predict(self, log, k, users:DataFrame, items:DataFrame, user_features=None, item_features=None, filter_seen_items=True):
+        
+        recs = users.join(items).drop('__iter')
+        
+        # Filter seen items
+        if filter_seen_items and log is not None:
+            seen = log.select("user_idx", "item_idx")
+            recs = recs.join(seen, on=["user_idx", "item_idx"], how="left_anti")
+            
+        # Format data
+        recs = recs.toPandas().copy()
+        recs = pd.get_dummies(recs, dtype=float)
+        recs['orig_price'] = recs['price']
+        recs['price'] = self.scaler.transform(recs[['price']])
+
+        # Use model to predict likelihoods
+        recs['prob'] = self.model.predict_proba(recs.drop(['user_idx', 'item_idx', 'orig_price'], axis=1))[:,np.where(self.model.classes_ == 1)[0][0]]
+        
+        # Relevance = purchase probability x price
+        recs['relevance'] = recs['prob']*recs['orig_price']
+        
+        # Filter top k most relevant items
+        recs = recs.sort_values(by=['user_idx', 'relevance'], ascending=[True, False])
+        recs = recs.groupby('user_idx').head(k)
+
+        recs['price'] = recs['orig_price']
+        
+        # Convert back to Spark and fix schema types to match original log
+        from pyspark.sql.types import LongType
+        result = pandas_to_spark(recs)
+        result = result.withColumn("user_idx", sf.col("user_idx").cast(LongType()))
+        result = result.withColumn("item_idx", sf.col("item_idx").cast(LongType()))
+       
+        return result
     
 # Cell: Data Exploration Functions
 """

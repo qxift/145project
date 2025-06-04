@@ -616,10 +616,11 @@ def run_recommender_analysis():
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
         MyRecommender(seed=42),  # Add your custom recommender here
         DecisionTreeRecommender(seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0),
+        LogisticRegressionRecommender()
     ] 
     recommender_names = [
         "Random", "Popularity", "ContentBased", "MyRecommender", 
-        "DecisionTree"
+        "DecisionTree", "LogisticRegression"
     ]
     
     # Initialize recommenders with initial history

@@ -148,7 +148,7 @@ from sklearn.tree import DecisionTreeClassifier
 import pandas as pd
 
 class DecisionTreeRecommender:
-    def __init__(self, seed=None, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0):
+    def __init__(self, seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0):
         self.seed = seed
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
@@ -306,7 +306,95 @@ class LogisticRegressionRecommender:
         result = result.withColumn("item_idx", sf.col("item_idx").cast(LongType()))
        
         return result
-    
+
+class KNNRecommender:
+    """
+    User-based KNN collaborative filtering recommender.
+    Recommends items liked by similar users based on historical interactions.
+    """
+    def __init__(self, k=5, seed=None):
+        self.k = k
+        self.seed = seed
+        self.user_item_matrix = None
+        self.user_sim_matrix = None
+        self.user_ids = None
+        self.item_ids = None
+
+    def fit(self, log, user_features=None, item_features=None):
+        # Convert log to Pandas for similarity computation
+        pd_log = log.select("user_idx", "item_idx", "relevance").toPandas()
+        if pd_log.empty:
+            self.user_item_matrix = None
+            self.user_sim_matrix = None
+            self.user_ids = None
+            self.item_ids = None
+            return
+        user_item = pd.pivot_table(pd_log, index="user_idx", columns="item_idx", values="relevance", fill_value=0)
+        self.user_item_matrix = user_item
+        self.user_ids = user_item.index.tolist()
+        self.item_ids = user_item.columns.tolist()
+        # Compute cosine similarity between users
+        from sklearn.metrics.pairwise import cosine_similarity
+        self.user_sim_matrix = pd.DataFrame(
+            cosine_similarity(user_item),
+            index=user_item.index,
+            columns=user_item.index
+        )
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        import pandas as pd
+        from sim4rec.utils import pandas_to_spark
+        from pyspark.sql.types import LongType
+        import numpy as np
+        import pyspark.sql.functions as sf
+
+        if self.user_sim_matrix is None or self.user_item_matrix is None:
+            # Fallback to random if not fitted
+            random_rec = RandomRecommender(seed=self.seed)
+            return random_rec.predict(log, k, users, items, filter_seen_items=filter_seen_items)
+
+        user_list = users.select("user_idx").toPandas()["user_idx"].tolist()
+        item_list = items.select("item_idx").toPandas()["item_idx"].tolist()
+        recs = []
+        for user_id in user_list:
+            if user_id not in self.user_sim_matrix.index:
+                continue
+            # Find k most similar users (excluding self)
+            neighbors = (
+                self.user_sim_matrix.loc[user_id]
+                .drop(user_id, errors='ignore')
+                .sort_values(ascending=False)
+                .head(self.k)
+                .index
+            )
+            # Aggregate their item preferences
+            neighbor_items = self.user_item_matrix.loc[neighbors].sum(axis=0)
+            # Remove items already seen by the user
+            if user_id in self.user_item_matrix.index:
+                seen_items = set(self.user_item_matrix.loc[user_id][self.user_item_matrix.loc[user_id] > 0].index)
+            else:
+                seen_items = set()
+            candidate_items = neighbor_items.drop(seen_items, errors='ignore')
+            # Only recommend items that exist in the current items list
+            candidate_items = candidate_items[candidate_items.index.isin(item_list)]
+            # Get top-k items
+            top_items = candidate_items.sort_values(ascending=False).head(k)
+            for item_id, score in top_items.items():
+                recs.append({"user_idx": user_id, "item_idx": item_id, "relevance": float(score)})
+        # Convert to DataFrame and then to Spark DataFrame
+        recs_df = pd.DataFrame(recs)
+        if recs_df.empty:
+            # Fallback: recommend random items if no recs
+            random_rec = RandomRecommender(seed=self.seed)
+            return random_rec.predict(log, k, users, items, filter_seen_items=filter_seen_items)
+        # Ensure correct types
+        recs_df["user_idx"] = recs_df["user_idx"].astype(np.int64)
+        recs_df["item_idx"] = recs_df["item_idx"].astype(np.int64)
+        result = pandas_to_spark(recs_df)
+        result = result.withColumn("user_idx", sf.col("user_idx").cast(LongType()))
+        result = result.withColumn("item_idx", sf.col("item_idx").cast(LongType()))
+        return result
+
 # Cell: Data Exploration Functions
 """
 ## Data Exploration Functions
@@ -616,11 +704,12 @@ def run_recommender_analysis():
         ContentBasedRecommender(similarity_threshold=0.0, seed=42),
         MyRecommender(seed=42),  # Add your custom recommender here
         DecisionTreeRecommender(seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0),
-        LogisticRegressionRecommender()
+        LogisticRegressionRecommender(),
+        KNNRecommender(k=5, seed=42)
     ] 
     recommender_names = [
         "Random", "Popularity", "ContentBased", "MyRecommender", 
-        "DecisionTree", "LogisticRegression"
+        "DecisionTree", "LogisticRegression", "KNN"
     ]
     
     # Initialize recommenders with initial history

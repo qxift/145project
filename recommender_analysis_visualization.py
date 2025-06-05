@@ -348,16 +348,23 @@ class KNNRecommender:
         import numpy as np
         import pyspark.sql.functions as sf
 
+        # Fallback to PopularityRecommender if not fitted
         if self.user_sim_matrix is None or self.user_item_matrix is None:
-            # Fallback to random if not fitted
-            random_rec = RandomRecommender(seed=self.seed)
-            return random_rec.predict(log, k, users, items, filter_seen_items=filter_seen_items)
+            pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
+            pop_rec.fit(log, user_features, item_features)
+            return pop_rec.predict(log, k, users, items, user_features, item_features, filter_seen_items=filter_seen_items)
 
         user_list = users.select("user_idx").toPandas()["user_idx"].tolist()
         item_list = items.select("item_idx").toPandas()["item_idx"].tolist()
         recs = []
         for user_id in user_list:
             if user_id not in self.user_sim_matrix.index:
+                # Fallback for users with no history
+                pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
+                pop_rec.fit(log, user_features, item_features)
+                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), items, user_features, item_features, filter_seen_items=filter_seen_items)
+                pop_recs_pd = pop_recs.select("user_idx", "item_idx", "relevance").toPandas()
+                recs.extend(pop_recs_pd.to_dict("records"))
                 continue
             # Find k most similar users (excluding self)
             neighbors = (
@@ -379,14 +386,23 @@ class KNNRecommender:
             candidate_items = candidate_items[candidate_items.index.isin(item_list)]
             # Get top-k items
             top_items = candidate_items.sort_values(ascending=False).head(k)
-            for item_id, score in top_items.items():
-                recs.append({"user_idx": user_id, "item_idx": item_id, "relevance": float(score)})
+            if top_items.empty:
+                # Fallback to popularity if no candidate items
+                pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
+                pop_rec.fit(log, user_features, item_features)
+                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), items, user_features, item_features, filter_seen_items=filter_seen_items)
+                pop_recs_pd = pop_recs.select("user_idx", "item_idx", "relevance").toPandas()
+                recs.extend(pop_recs_pd.to_dict("records"))
+            else:
+                for item_id, score in top_items.items():
+                    recs.append({"user_idx": user_id, "item_idx": item_id, "relevance": float(score)})
         # Convert to DataFrame and then to Spark DataFrame
         recs_df = pd.DataFrame(recs)
         if recs_df.empty:
-            # Fallback: recommend random items if no recs
-            random_rec = RandomRecommender(seed=self.seed)
-            return random_rec.predict(log, k, users, items, filter_seen_items=filter_seen_items)
+            # Fallback: recommend popular items if no recs at all
+            pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
+            pop_rec.fit(log, user_features, item_features)
+            return pop_rec.predict(log, k, users, items, user_features, item_features, filter_seen_items=filter_seen_items)
         # Ensure correct types
         recs_df["user_idx"] = recs_df["user_idx"].astype(np.int64)
         recs_df["item_idx"] = recs_df["item_idx"].astype(np.int64)

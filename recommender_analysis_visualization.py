@@ -145,7 +145,6 @@ class MyRecommender:
 
 
 from sklearn.tree import DecisionTreeClassifier
-import pandas as pd
 
 class DecisionTreeRecommender:
     def __init__(self, seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0):
@@ -410,6 +409,198 @@ class KNNRecommender:
         result = result.withColumn("user_idx", sf.col("user_idx").cast(LongType()))
         result = result.withColumn("item_idx", sf.col("item_idx").cast(LongType()))
         return result
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TransformerRecommender:
+    def __init__(self, n_items, embedding_dim=64, n_heads=4, n_layers=2, max_seq_len=50, dropout=0.2, seed=42):
+        torch.manual_seed(seed)
+        self.n_items = n_items
+        self.embedding_dim = embedding_dim
+        self.max_seq_len = max_seq_len
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.item_embedding = nn.Embedding(n_items + 1, embedding_dim, padding_idx=0)
+        self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=n_heads, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.output_layer = nn.Linear(embedding_dim, n_items + 1)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        self.to(self.device)
+
+    def parameters(self):
+        return list(self.item_embedding.parameters()) + \
+               list(self.pos_embedding.parameters()) + \
+               list(self.transformer.parameters()) + \
+               list(self.output_layer.parameters())
+
+    def to(self, device):
+        self.item_embedding = self.item_embedding.to(device)
+        self.pos_embedding = self.pos_embedding.to(device)
+        self.transformer = self.transformer.to(device)
+        self.output_layer = self.output_layer.to(device)
+
+    def fit(self, log, user_features=None, item_features=None, epochs=10, batch_size=128):
+        df = log.select("user_idx", "item_idx").toPandas()
+        df["interaction_order"] = df.groupby("user_idx").cumcount()
+        df = df.sort_values(["user_idx", "interaction_order"])
+        user_sequences = df.groupby("user_idx")["item_idx"].apply(list).values
+
+        padded_seqs = [([0] * (self.max_seq_len - len(seq)) + seq[-self.max_seq_len:]) for seq in user_sequences]
+        inputs = torch.tensor(padded_seqs, dtype=torch.long).to(self.device)
+        targets = inputs.clone()
+
+        for epoch in range(epochs):
+            for i in range(0, len(inputs), batch_size):
+                x = inputs[i:i + batch_size]
+                y = targets[i:i + batch_size]
+                seq_len = x.shape[1]
+                pos_ids = torch.arange(seq_len).unsqueeze(0).repeat(x.size(0), 1).to(self.device)
+
+                emb = self.item_embedding(x) + self.pos_embedding(pos_ids)
+                attention_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(self.device)
+                output = self.transformer(emb, mask=attention_mask)
+
+                pooled = output.mean(dim=1)
+                logits = self.output_layer(pooled)
+                loss = F.cross_entropy(logits, y[:, -1], ignore_index=0)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        user_seq_df = log.select("user_idx", "item_idx").toPandas()
+        user_seq_df["interaction_order"] = user_seq_df.groupby("user_idx").cumcount()
+        user_seq_df = user_seq_df.sort_values(["user_idx", "interaction_order"])
+        user_seq_dict = user_seq_df.groupby("user_idx")["item_idx"].apply(list).to_dict()
+
+        all_items = items.select("item_idx", "price").toPandas()
+        results = []
+
+        for user_id in users.select("user_idx").toPandas()["user_idx"]:
+            seq = user_seq_dict.get(user_id, [])
+            seq = [0] * (self.max_seq_len - len(seq)) + seq[-self.max_seq_len:]
+            input_tensor = torch.tensor([seq], dtype=torch.long).to(self.device)
+            pos_ids = torch.arange(self.max_seq_len).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                emb = self.item_embedding(input_tensor) + self.pos_embedding(pos_ids)
+                output = self.transformer(emb)
+                pooled = output.mean(dim=1)
+                logits = self.output_layer(pooled).squeeze(0).cpu().numpy()
+
+            item_scores = pd.DataFrame({
+                "item_idx": range(len(logits)),
+                "prob": logits
+            }).merge(all_items, on="item_idx", how="inner")
+            item_scores["relevance"] = item_scores["prob"] * item_scores["price"]
+            topk = item_scores.sort_values("relevance", ascending=False).head(k)
+            topk["user_idx"] = user_id
+            results.append(topk[["user_idx", "item_idx", "relevance"]])
+
+        final_df = pd.concat(results)
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        return spark.createDataFrame(final_df.astype({"user_idx": int, "item_idx": int}))
+
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from gensim.models import Word2Vec
+
+class Node2VecRecommender:
+    def __init__(self, walk_length=8, num_walks=40, embedding_dim=32, window_size=4, epochs=3, seed=42):
+        self.embedding_dim = embedding_dim
+        self.walk_length = walk_length
+        self.num_walks = num_walks
+        self.window_size = window_size
+        self.epochs = epochs
+        self.seed = seed
+
+    def fit(self, log, user_features=None, item_features=None):
+        import networkx as nx
+        from gensim.models import Word2Vec
+        import numpy as np
+
+        df = log.select("user_idx", "item_idx").toPandas()
+        offset = df["user_idx"].max() + 1
+        df["item_idx"] += offset
+
+        self.offset = offset
+        self.user_ids = df["user_idx"].unique()
+        self.item_ids = df["item_idx"].unique() - offset
+
+        G = nx.Graph()
+        G.add_edges_from(df[["user_idx", "item_idx"]].values)
+
+        np.random.seed(self.seed)
+        walks = []
+        for _ in range(self.num_walks):
+            for node in np.random.permutation(G.nodes()):
+                walk = [node]
+                while len(walk) < self.walk_length:
+                    neighbors = list(G.neighbors(walk[-1]))
+                    if neighbors:
+                        walk.append(np.random.choice(neighbors))
+                    else:
+                        break
+                walks.append([str(n) for n in walk])
+
+        self.model = Word2Vec(
+            sentences=walks,
+            vector_size=self.embedding_dim,
+            window=self.window_size,
+            sg=1,
+            workers=1,
+            epochs=self.epochs,
+            seed=self.seed
+        )
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        import numpy as np
+        import pandas as pd
+        from sklearn.metrics.pairwise import cosine_similarity
+        from sim4rec.utils import pandas_to_spark
+
+        items_df = items.select("item_idx", "price").toPandas()
+        item_vecs = np.stack([
+            self.model.wv[str(i + self.offset)] if str(i + self.offset) in self.model.wv else np.zeros(self.embedding_dim)
+            for i in items_df["item_idx"]
+        ])
+
+        results = []
+        seen_df = log.select("user_idx", "item_idx").toPandas() if filter_seen_items else pd.DataFrame()
+
+        for user_id in users.select("user_idx").toPandas()["user_idx"]:
+            user_key = str(user_id)
+            if user_key not in self.model.wv:
+                continue
+            user_vec = self.model.wv[user_key].reshape(1, -1)
+            sims = cosine_similarity(user_vec, item_vecs).flatten()
+
+            item_scores = items_df.copy()
+            item_scores["relevance"] = sims * item_scores["price"]
+
+            if filter_seen_items:
+                seen_items = seen_df[seen_df["user_idx"] == user_id]["item_idx"].values
+                item_scores = item_scores[~item_scores["item_idx"].isin(seen_items)]
+
+            topk = item_scores.nlargest(k, "relevance")[["item_idx", "relevance"]]
+            topk["user_idx"] = user_id
+            results.append(topk[["user_idx", "item_idx", "relevance"]])
+
+        if results:
+            final_df = pd.concat(results)
+        else:
+            final_df = pd.DataFrame(columns=["user_idx", "item_idx", "relevance"])
+
+        return pandas_to_spark(final_df.astype({"user_idx": int, "item_idx": int}))
 
 # Cell: Data Exploration Functions
 """
@@ -721,11 +912,20 @@ def run_recommender_analysis():
         MyRecommender(seed=42),  # Add your custom recommender here
         DecisionTreeRecommender(seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0),
         LogisticRegressionRecommender(),
-        KNNRecommender(k=5, seed=42)
+        KNNRecommender(k=5, seed=42),
+        TransformerRecommender(n_items=items_df.count()),
+        Node2VecRecommender()
     ] 
     recommender_names = [
-        "Random", "Popularity", "ContentBased", "MyRecommender", 
-        "DecisionTree", "LogisticRegression", "KNN"
+        "Random", 
+        "Popularity", 
+        "ContentBased", 
+        "MyRecommender", 
+        "DecisionTree", 
+        "LogisticRegression",
+        "KNN", 
+        "Transformer", 
+        "Node2Vec"
     ]
     
     # Initialize recommenders with initial history

@@ -308,106 +308,428 @@ class LogisticRegressionRecommender:
 
 class KNNRecommender:
     """
-    User-based KNN collaborative filtering recommender.
-    Recommends items liked by similar users based on historical interactions.
+    Sequence-Aware KNN Collaborative Filtering for Checkpoint 2
+    
+    Implements three sequence-based recommendation variants as required:
+    1. Session-based KNN: Similarity based on recent interaction patterns  
+    2. Sequential Pattern KNN: Similarity based on item-to-item transition patterns
+    3. Temporal KNN: Similarity with temporal decay weighting for recency
+    
+    Key Features:
+    - Maintains ordered sequences of user interactions across training iterations
+    - Each sequence element contains (timestamp, item_id, price, response)
+    - Revenue-aware ranking using expected_revenue = price × probability
+    - Handles sequence construction with configurable max length
+    - Robust fallback mechanisms for cold-start users
     """
-    def __init__(self, k=5, seed=None):
+    
+    def __init__(self, k=5, variant="session", max_seq_len=50, temporal_decay=0.8, seed=None):
+        """
+        Initialize the sequence-aware KNN recommender.
+        
+        Args:
+            k (int): Number of nearest neighbors to consider
+            variant (str): KNN variant - "session", "pattern", or "temporal"
+            max_seq_len (int): Maximum sequence length to maintain (last N interactions)
+            temporal_decay (float): Decay factor for temporal weighting (0-1)
+            seed (int): Random seed for reproducibility
+        """
         self.k = k
+        self.variant = variant
+        self.max_seq_len = max_seq_len
+        self.temporal_decay = temporal_decay
         self.seed = seed
-        self.user_item_matrix = None
-        self.user_sim_matrix = None
-        self.user_ids = None
-        self.item_ids = None
+        
+        # Data structures for sequence-aware recommendations
+        self.user_sequences = {}  # {user_id: [interaction_dicts]}
+        self.item_prices = {}     # {item_id: price} for revenue calculation
+        self.user_similarities = {}  # Cache for computed similarities
+        
+    def _extract_sequences(self, log):
+        """
+        Extract ordered sequences of user interactions from log data.
+        
+        Handles multiple log formats:
+        - Full simulation logs with price, response, __iter columns
+        - Initial history with only relevance column
+        - Minimal logs with just user_idx, item_idx
+        
+        Returns:
+            tuple: (user_sequences, item_prices)
+        """
+        import pandas as pd
+        
+        available_cols = log.columns
+        
+        # Handle different log formats gracefully
+        if "price" in available_cols and "response" in available_cols:
+            # Full simulation log format
+            df = log.select("user_idx", "item_idx", "price", "response", "__iter").toPandas()
+        elif "relevance" in available_cols:
+            # Initial history format - use relevance as response
+            df = log.select("user_idx", "item_idx", "relevance").toPandas()
+            df["response"] = df["relevance"]
+            df["price"] = 10.0  # Default price for initial history
+            df["__iter"] = "start"
+        else:
+            # Minimal format - create defaults
+            df = log.select("user_idx", "item_idx").toPandas()
+            df["response"] = 1
+            df["price"] = 10.0
+            df["__iter"] = "start"
+        
+        # Sort by user and iteration order to maintain sequence
+        df = df.sort_values(["user_idx", "__iter"])
+        
+        # Build user sequences and item price mapping
+        user_sequences = {}
+        item_prices = {}
+        
+        for user_id, group in df.groupby("user_idx"):
+            sequence = []
+            for _, row in group.iterrows():
+                interaction = {
+                    'item_id': row['item_idx'],
+                    'price': row['price'],
+                    'response': row['response'],
+                    'iteration': row['__iter']
+                }
+                sequence.append(interaction)
+                item_prices[row['item_idx']] = row['price']
+            
+            # Keep only the most recent max_seq_len interactions
+            user_sequences[user_id] = sequence[-self.max_seq_len:]
+        
+        return user_sequences, item_prices
+    
+    def _session_similarity(self, seq1, seq2):
+        """
+        Calculate similarity based on recent interaction patterns.
+        
+        Uses Jaccard similarity on recent items plus purchase pattern similarity.
+        Focuses on the last 10 interactions for session-like behavior.
+        """
+        if not seq1 or not seq2:
+            return 0.0
+        
+        # Extract recent item IDs (last 10 interactions)
+        recent_items1 = [interaction['item_id'] for interaction in seq1[-10:]]
+        recent_items2 = [interaction['item_id'] for interaction in seq2[-10:]]
+        
+        # Jaccard similarity on item sets
+        set1, set2 = set(recent_items1), set(recent_items2)
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        
+        if union == 0:
+            return 0.0
+        
+        jaccard_sim = intersection / union
+        
+        # Purchase pattern similarity (compare purchase rates)
+        purchases1 = sum(1 for interaction in seq1[-10:] if interaction['response'] > 0)
+        purchases2 = sum(1 for interaction in seq2[-10:] if interaction['response'] > 0)
+        
+        max_interactions = max(len(seq1[-10:]), len(seq2[-10:]))
+        purchase_sim = 1.0 - abs(purchases1 - purchases2) / max_interactions if max_interactions > 0 else 0.0
+        
+        # Weighted combination: 70% item overlap + 30% purchase behavior
+        return 0.7 * jaccard_sim + 0.3 * purchase_sim
+    
+    def _pattern_similarity(self, seq1, seq2):
+        """
+        Calculate similarity based on sequential transition patterns.
+        
+        Analyzes item-to-item transitions and computes cosine similarity
+        between transition frequency vectors.
+        """
+        if len(seq1) < 2 or len(seq2) < 2:
+            return 0.0
+        
+        def extract_transitions(sequence):
+            """Extract item-to-item transitions from sequence."""
+            transitions = {}
+            for i in range(len(sequence) - 1):
+                from_item = sequence[i]['item_id']
+                to_item = sequence[i + 1]['item_id']
+                transition = (from_item, to_item)
+                transitions[transition] = transitions.get(transition, 0) + 1
+            return transitions
+        
+        # Get transition patterns for both sequences
+        trans1 = extract_transitions(seq1)
+        trans2 = extract_transitions(seq2)
+        
+        # Get all unique transitions
+        all_transitions = set(trans1.keys()).union(set(trans2.keys()))
+        
+        if not all_transitions:
+            return 0.0
+        
+        # Create transition frequency vectors
+        vec1 = [trans1.get(t, 0) for t in all_transitions]
+        vec2 = [trans2.get(t, 0) for t in all_transitions]
+        
+        # Compute cosine similarity
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = sum(a * a for a in vec1) ** 0.5
+        norm2 = sum(b * b for b in vec2) ** 0.5
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    def _temporal_similarity(self, seq1, seq2):
+        """
+        Calculate similarity with temporal decay weighting.
+        
+        More recent interactions receive higher weights using exponential decay.
+        Shared items across sequences contribute based on their recency.
+        """
+        if not seq1 or not seq2:
+            return 0.0
+        
+        def iter_to_numeric(iter_val):
+            """Convert iteration strings to numeric values for temporal ordering."""
+            if isinstance(iter_val, str):
+                if iter_val == "start":
+                    return 0
+                elif iter_val.startswith("train_"):
+                    return int(iter_val.split("_")[1]) + 1
+                elif iter_val.startswith("test_"):
+                    return int(iter_val.split("_")[1]) + 100
+                else:
+                    return 0
+            else:
+                return int(iter_val) if iter_val is not None else 0
+        
+        # Find the most recent iteration for temporal weighting
+        max_iter1 = max(iter_to_numeric(interaction['iteration']) for interaction in seq1)
+        max_iter2 = max(iter_to_numeric(interaction['iteration']) for interaction in seq2)
+        max_iter = max(max_iter1, max_iter2)
+        
+        # Calculate weighted similarity based on shared items and recency
+        weighted_sim = 0.0
+        total_weight = 0.0
+        
+        items1 = [(interaction['item_id'], iter_to_numeric(interaction['iteration'])) 
+                  for interaction in seq1]
+        items2 = [(interaction['item_id'], iter_to_numeric(interaction['iteration'])) 
+                  for interaction in seq2]
+        
+        # For each pair of interactions involving the same item
+        for item1, iter1 in items1:
+            for item2, iter2 in items2:
+                if item1 == item2:  # Same item in both sequences
+                    # Apply temporal decay based on how recent the interactions were
+                    weight1 = self.temporal_decay ** (max_iter - iter1)
+                    weight2 = self.temporal_decay ** (max_iter - iter2)
+                    combined_weight = weight1 * weight2
+                    
+                    weighted_sim += combined_weight
+                    total_weight += combined_weight
+        
+        return weighted_sim / total_weight if total_weight > 0 else 0.0
+    
+    def _calculate_similarity(self, seq1, seq2):
+        """
+        Calculate similarity between two sequences based on selected variant.
+        
+        Args:
+            seq1, seq2: User interaction sequences
+            
+        Returns:
+            float: Similarity score between sequences
+        """
+        if self.variant == "session":
+            return self._session_similarity(seq1, seq2)
+        elif self.variant == "pattern":
+            return self._pattern_similarity(seq1, seq2)
+        elif self.variant == "temporal":
+            return self._temporal_similarity(seq1, seq2)
+        else:
+            # Default to session-based if variant not recognized
+            return self._session_similarity(seq1, seq2)
 
     def fit(self, log, user_features=None, item_features=None):
-        # Convert log to Pandas for similarity computation
-        pd_log = log.select("user_idx", "item_idx", "relevance").toPandas()
-        if pd_log.empty:
-            self.user_item_matrix = None
-            self.user_sim_matrix = None
-            self.user_ids = None
-            self.item_ids = None
+        """
+        Fit the sequence-aware KNN model.
+        
+        Extracts and stores user interaction sequences from the log data.
+        Sequences are maintained across training iterations to enable
+        sequence-based similarity computation.
+        
+        Args:
+            log: Interaction log DataFrame
+            user_features: User features DataFrame (optional)
+            item_features: Item features DataFrame (optional)
+        """
+        if log is None or log.count() == 0:
+            self.user_sequences = {}
+            self.item_prices = {}
             return
-        user_item = pd.pivot_table(pd_log, index="user_idx", columns="item_idx", values="relevance", fill_value=0)
-        self.user_item_matrix = user_item
-        self.user_ids = user_item.index.tolist()
-        self.item_ids = user_item.columns.tolist()
-        # Compute cosine similarity between users
-        from sklearn.metrics.pairwise import cosine_similarity
-        self.user_sim_matrix = pd.DataFrame(
-            cosine_similarity(user_item),
-            index=user_item.index,
-            columns=user_item.index
-        )
-
+        
+        # Extract sequences from interaction log
+        self.user_sequences, self.item_prices = self._extract_sequences(log)
+        
+        # Initialize similarity cache (computed on-demand during prediction)
+        self.user_similarities = {}
+        
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """
+        Generate sequence-aware recommendations.
+        
+        For each user:
+        1. Find k most similar users based on sequence similarity
+        2. Aggregate item preferences from similar users' sequences
+        3. Weight recommendations by position, response, and similarity
+        4. Rank by expected revenue (score × price)
+        
+        Args:
+            log: Current interaction log
+            k: Number of items to recommend per user
+            users: Users DataFrame
+            items: Items DataFrame
+            user_features: User features (optional)
+            item_features: Item features (optional)
+            filter_seen_items: Whether to exclude already seen items
+            
+        Returns:
+            DataFrame: Recommendations with user_idx, item_idx, relevance columns
+        """
         import pandas as pd
+        import numpy as np
         from sim4rec.utils import pandas_to_spark
         from pyspark.sql.types import LongType
-        import numpy as np
         import pyspark.sql.functions as sf
 
-        # Fallback to PopularityRecommender if not fitted
-        if self.user_sim_matrix is None or self.user_item_matrix is None:
+        # Fallback to PopularityRecommender if no sequences available
+        if not self.user_sequences:
             pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
             pop_rec.fit(log, user_features, item_features)
-            return pop_rec.predict(log, k, users, items, user_features, item_features, filter_seen_items=filter_seen_items)
+            return pop_rec.predict(log, k, users, items, user_features, item_features, 
+                                 filter_seen_items=filter_seen_items)
 
         user_list = users.select("user_idx").toPandas()["user_idx"].tolist()
-        item_list = items.select("item_idx").toPandas()["item_idx"].tolist()
-        recs = []
+        item_list = items.select("item_idx", "price").toPandas()
+        recommendations = []
+        
         for user_id in user_list:
-            if user_id not in self.user_sim_matrix.index:
-                # Fallback for users with no history
+            if user_id not in self.user_sequences:
+                # Cold start: fallback to PopularityRecommender
                 pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
                 pop_rec.fit(log, user_features, item_features)
-                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), items, user_features, item_features, filter_seen_items=filter_seen_items)
+                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), 
+                                         items, user_features, item_features, 
+                                         filter_seen_items=filter_seen_items)
                 pop_recs_pd = pop_recs.select("user_idx", "item_idx", "relevance").toPandas()
-                recs.extend(pop_recs_pd.to_dict("records"))
+                recommendations.extend(pop_recs_pd.to_dict("records"))
                 continue
-            # Find k most similar users (excluding self)
-            neighbors = (
-                self.user_sim_matrix.loc[user_id]
-                .drop(user_id, errors='ignore')
-                .sort_values(ascending=False)
-                .head(self.k)
-                .index
-            )
-            # Aggregate their item preferences
-            neighbor_items = self.user_item_matrix.loc[neighbors].sum(axis=0)
-            # Remove items already seen by the user
-            if user_id in self.user_item_matrix.index:
-                seen_items = set(self.user_item_matrix.loc[user_id][self.user_item_matrix.loc[user_id] > 0].index)
-            else:
-                seen_items = set()
-            candidate_items = neighbor_items.drop(seen_items, errors='ignore')
-            # Only recommend items that exist in the current items list
-            candidate_items = candidate_items[candidate_items.index.isin(item_list)]
-            # Get top-k items
-            top_items = candidate_items.sort_values(ascending=False).head(k)
-            if top_items.empty:
-                # Fallback to popularity if no candidate items
+            
+            user_sequence = self.user_sequences[user_id]
+            
+            # Find k most similar users using sequence similarity
+            similarities = []
+            for other_user_id, other_sequence in self.user_sequences.items():
+                if other_user_id != user_id:
+                    similarity = self._calculate_similarity(user_sequence, other_sequence)
+                    similarities.append((other_user_id, similarity))
+            
+            # Sort by similarity and select top-k neighbors
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            neighbors = similarities[:self.k]
+            
+            if not neighbors:
+                # No similar users found: fallback to popularity
                 pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
                 pop_rec.fit(log, user_features, item_features)
-                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), items, user_features, item_features, filter_seen_items=filter_seen_items)
+                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), 
+                                         items, user_features, item_features, 
+                                         filter_seen_items=filter_seen_items)
                 pop_recs_pd = pop_recs.select("user_idx", "item_idx", "relevance").toPandas()
-                recs.extend(pop_recs_pd.to_dict("records"))
+                recommendations.extend(pop_recs_pd.to_dict("records"))
+                continue
+            
+            # Generate recommendations based on neighbor sequences
+            item_scores = {}
+            
+            # Get items user has already seen (for filtering)
+            seen_items = set()
+            if filter_seen_items:
+                seen_items = {interaction['item_id'] for interaction in user_sequence}
+            
+            # Aggregate preferences from similar users
+            for neighbor_id, similarity in neighbors:
+                neighbor_sequence = self.user_sequences[neighbor_id]
+                
+                # Weight items from neighbor's sequence
+                for position, interaction in enumerate(neighbor_sequence):
+                    item_id = interaction['item_id']
+                    response = interaction['response']
+                    
+                    if item_id not in seen_items:
+                        # Position weight: more recent interactions get higher weight
+                        position_weight = (position + 1) / len(neighbor_sequence)
+                        
+                        # Response weight: purchased items get higher weight
+                        response_weight = 1.0 + response
+                        
+                        # Combined weight
+                        total_weight = similarity * position_weight * response_weight
+                        
+                        if item_id not in item_scores:
+                            item_scores[item_id] = 0.0
+                        item_scores[item_id] += total_weight
+            
+            # Convert scores to revenue-aware recommendations
+            candidate_items = []
+            for item_id, score in item_scores.items():
+                if item_id in item_list["item_idx"].values:
+                    # Get item price for revenue calculation
+                    price = item_list[item_list["item_idx"] == item_id]["price"].iloc[0]
+                    
+                    # Expected revenue = score (acting as probability) × price
+                    expected_revenue = score * price
+                    
+                    candidate_items.append({
+                        "user_idx": user_id,
+                        "item_idx": item_id,
+                        "relevance": expected_revenue
+                    })
+            
+            # Rank by expected revenue and select top-k
+            candidate_items.sort(key=lambda x: x["relevance"], reverse=True)
+            top_recommendations = candidate_items[:k]
+            
+            if not top_recommendations:
+                # No candidates: fallback to popularity
+                pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
+                pop_rec.fit(log, user_features, item_features)
+                pop_recs = pop_rec.predict(log, k, users.filter(sf.col("user_idx") == user_id), 
+                                         items, user_features, item_features, 
+                                         filter_seen_items=filter_seen_items)
+                pop_recs_pd = pop_recs.select("user_idx", "item_idx", "relevance").toPandas()
+                recommendations.extend(pop_recs_pd.to_dict("records"))
             else:
-                for item_id, score in top_items.items():
-                    recs.append({"user_idx": user_id, "item_idx": item_id, "relevance": float(score)})
-        # Convert to DataFrame and then to Spark DataFrame
-        recs_df = pd.DataFrame(recs)
-        if recs_df.empty:
-            # Fallback: recommend popular items if no recs at all
+                recommendations.extend(top_recommendations)
+        
+        # Convert to Spark DataFrame with proper types
+        if not recommendations:
+            # Return empty recommendations if nothing generated
             pop_rec = PopularityRecommender(alpha=1.0, seed=self.seed)
             pop_rec.fit(log, user_features, item_features)
-            return pop_rec.predict(log, k, users, items, user_features, item_features, filter_seen_items=filter_seen_items)
-        # Ensure correct types
+            return pop_rec.predict(log, k, users, items, user_features, item_features, 
+                                 filter_seen_items=filter_seen_items)
+        
+        recs_df = pd.DataFrame(recommendations)
         recs_df["user_idx"] = recs_df["user_idx"].astype(np.int64)
         recs_df["item_idx"] = recs_df["item_idx"].astype(np.int64)
+        
         result = pandas_to_spark(recs_df)
         result = result.withColumn("user_idx", sf.col("user_idx").cast(LongType()))
         result = result.withColumn("item_idx", sf.col("item_idx").cast(LongType()))
+        
         return result
 
 import torch
@@ -2025,14 +2347,14 @@ def run_recommender_analysis():
         # ContentBasedRecommender(similarity_threshold=0.0, seed=42),
         # MyRecommender(seed=42),  # Add your custom recommender here
         # DecisionTreeRecommender(seed=42, max_depth=5, min_samples_leaf=1, min_samples_split=2, ccp_alpha=0.0),
-        LogisticRegressionRecommender(),
-        # KNNRecommender(k=5, seed=42),
-        TransformerRecommender(),
-        AutoRegressiveRecommender(),
-        LSTMRecommender(),
-        GATRecommender(),
-        GCNRecommender(),
-        Node2VecRecommender()
+        # LogisticRegressionRecommender(),
+        KNNRecommender(),
+        # TransformerRecommender(),
+        # AutoRegressiveRecommender(),
+        # LSTMRecommender(),
+        # GATRecommender(),
+        # GCNRecommender(),
+        # Node2VecRecommender()
     ] 
     recommender_names = [
         # "Random", 
@@ -2040,14 +2362,14 @@ def run_recommender_analysis():
         # "ContentBased", 
         # "MyRecommender", 
         # "DecisionTree", 
-        "LogisticRegression",
-        # "KNN", 
-        "Transformer", 
-        "AutoRegressiveRecommender",
-        "LSTMRecommender",
-        "GATRecommender",
-        "GCNRecommender",
-        "Node2Vec"
+        # "LogisticRegression",
+        "KNN", 
+        # "Transformer", 
+        # "AutoRegressiveRecommender",
+        # "LSTMRecommender",
+        # "GATRecommender",
+        # "GCNRecommender",
+        # "Node2Vec"
     ]
     
     # Initialize recommenders with initial history

@@ -602,6 +602,330 @@ class Node2VecRecommender:
 
         return pandas_to_spark(final_df.astype({"user_idx": int, "item_idx": int}))
 
+from pyspark.sql import Window
+from torch_geometric.data import Data
+from torch_geometric.nn import GATConv
+import random
+
+class LSTMRecommender:
+    # Packages sequences into tensors
+    class SequenceDataset(data.Dataset):
+        def __init__(self, sequences, item_features_tensor):
+            self.sequences = sequences
+            self.item_features_tensor = item_features_tensor
+        
+        def __len__(self):
+            return len(self.sequences)
+    
+        def __getitem__(self, idx):
+            seq, target = self.sequences[idx]
+            seq_tensor = torch.tensor(seq, dtype=torch.long)
+            target_tensor = torch.tensor(target, dtype=torch.long)
+            feature_tensor = self.item_features_tensor[seq_tensor]
+            return seq_tensor, feature_tensor, target_tensor
+    # LSTM model
+    class LSTMRec(nn.Module):
+        def __init__(self, num_items, item_feature_dim, embedding_dim=64, hidden_dim=64, num_layers=2):
+            super(MyRecommender.LSTMRec, self).__init__()
+            self.item_embedding = nn.Embedding(num_items, embedding_dim)
+            self.item_feature_proj = nn.Linear(item_feature_dim, 16)
+            self.lstm_input_dim = embedding_dim + 16
+            self.lstm = nn.LSTM(self.lstm_input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.5)
+            self.fc = nn.Linear(hidden_dim, num_items)
+        
+        def forward(self, item_ids, item_features):
+            embedded = self.item_embedding(item_ids)
+            features_proj = self.item_feature_proj(item_features)
+            lstm_input = torch.cat([embedded, features_proj], dim=-1)
+            lstm_out, _ = self.lstm(lstm_input)
+            out = lstm_out[:, -1, :]
+            logits = self.fc(out)
+            return logits
+            
+    def __init__(self, seed=42, sequence_length=1, embedding_dim=64, hidden_dim=64, num_epochs=5):
+        """
+        Initialize recommender.
+        
+        Args:
+            seed: Random seed for reproducibility
+        """
+        self.seed = seed
+        self.sequence_length = sequence_length
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_epochs = num_epochs
+        self.user_profiles = defaultdict(list)
+        self.model = None
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Creates user profile sequences using item indices
+    def create_dataset(self, log):
+        log_pd = log.drop('relevance').toPandas()
+        for _, row in log_pd.iterrows():
+            self.user_profiles[row['user_idx']].append(row['item_idx'])
+        sequence_length = self.sequence_length
+        train_sequences = []
+        for user, items in self.user_profiles.items():
+            if len(items) > sequence_length:
+                for i in range(sequence_length, len(items)):
+                    seq = items[i-sequence_length:i]
+                    target = items[i]
+                    train_sequences.append((seq, target))
+        return train_sequences
+    
+    def fit(self, log, user_features=None, item_features=None):
+        # Return if empty log
+        if log is None or log.count() == 0 or item_features is None:
+            return
+
+        # Build feature tensor
+        item_features_pd = item_features.toPandas().sort_values('item_idx')
+        item_features_pd = pd.get_dummies(item_features_pd, dtype=float)
+        feature_cols = [col for col in item_features_pd.columns if col != 'item_idx']
+        item_feature_tensor = torch.zeros((item_features_pd['item_idx'].max() + 1, len(feature_cols)))
+        for _, row in item_features_pd.iterrows():
+            item_feature_tensor[int(row['item_idx'])] = torch.tensor(row[feature_cols].values,dtype=torch.float)
+
+        # Item and feature counts
+        total_items = item_feature_tensor.size(0)
+        item_feats = len(feature_cols)
+        
+        # Create user sequences, load data
+        train_sequences = self.create_dataset(log)
+        train_dataset = self.SequenceDataset(train_sequences, item_feature_tensor)
+        train_loader = data.DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+        # Initialize LSTM Recommender, criterion, optimizer
+        self.model = self.LSTMRec(num_items=total_items,item_feature_dim=item_feats, embedding_dim=self.embedding_dim,
+                                                   hidden_dim=self.hidden_dim).to(self.device)
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
+
+        # Train model, embedding item features
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            total_loss = 0
+            for sequences, features, targets in train_loader:
+                sequences, features, targets = sequences.to(self.device), features.to(self.device), targets.to(self.device)
+                self.optimizer.zero_grad()
+                outputs = self.model(sequences, features)
+                loss = self.criterion(outputs, targets)
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+            print(f"Epoch {epoch+1}, Loss: {total_loss / len(train_loader)}")
+
+        # Save item feature tensor for future use
+        self.item_feature_tensor = item_feature_tensor.to(self.device)
+    
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        # Raise error if model is not trained
+        if self.model is None:
+            raise ValueError("Model has not been trained. Call fit() before predict().")
+
+        self.model.eval()
+        recommendations = []
+
+        with torch.no_grad():
+            # For each user in userbase
+            for user in users.toPandas()['user_idx']:
+                seq = self.user_profiles.get(user, [])
+                seq = seq[-self.sequence_length:]
+                # Zero pad sequences if too short
+                if len(seq) < self.sequence_length:
+                    seq = [0] * (self.sequence_length - len(seq)) + seq
+
+                sequence_tensor = torch.tensor(seq, dtype=torch.long).unsqueeze(0).to(self.device)
+                feature_tensor = self.item_feature_tensor[sequence_tensor].to(self.device)
+
+                logits = self.model(sequence_tensor, feature_tensor)
+                probs = torch.softmax(logits, dim=1)
+                topk = torch.topk(probs, k=k)
+                recommended_item_indices = topk.indices.cpu().numpy().flatten()
+
+                if filter_seen_items:
+                    seen_items = set(self.user_profiles.get(user, []))
+                    recommended_item_indices = [item for item in recommended_item_indices if item not in seen_items]
+
+                # Item relevance = probability from model * item price
+                for item in recommended_item_indices[:k]:
+                    #prices = items.select('price').where(items.item_idx == item).rdd.flatMap(lambda x: x).collect()
+                    #price = prices[0]
+                    relevance = probs[0, item].item()
+                    recommendations.append({
+                        "user_idx": user,
+                        "item_idx": item,
+                        "relevance": relevance
+                    })
+
+        recommendations_df = pd.DataFrame(recommendations)
+        recs = spark.createDataFrame(recommendations_df)
+        return recs
+
+class GATRecommender:
+    class GATRec(nn.Module):
+        def __init__(self, num_nodes, user_feat_dim, item_feat_dim, embedding_dim=256, heads=8):
+            super().__init__()
+            self.node_embedding = nn.Embedding(num_nodes, embedding_dim)
+            in_channels = embedding_dim + user_feat_dim + item_feat_dim
+            self.gat1 = GATConv(in_channels, embedding_dim, heads=heads, dropout=0.1)
+            self.gat2 = GATConv(embedding_dim * heads, embedding_dim, heads=1, concat=False, dropout=0.1)
+
+        def forward(self, edge_index, user_feats, item_feats):
+            x = self.node_embedding.weight
+
+            # Features are floats already shaped [num_nodes, num_features]
+            concat_embeds = torch.cat([x, user_feats, item_feats], dim=1)
+
+            x = self.gat1(concat_embeds, edge_index)
+            x = torch.relu(x)
+            x = self.gat2(x, edge_index)
+            return x
+
+    def __init__(self, seed=42, embedding_dim=256, num_epochs=10):
+        self.seed = seed
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.embedding_dim = embedding_dim
+        self.num_epochs = num_epochs
+        self.model = None
+        self.user_item_mapping = {}
+
+    def fit(self, log, user_features, item_features):
+        import torch.nn.functional as F
+
+        log_pd = log.select("user_idx", "item_idx", "relevance").toPandas()
+        user_feat_pd = pd.get_dummies(user_features.toPandas(), dtype=float)
+        item_feat_pd = pd.get_dummies(item_features.toPandas(), dtype=float)
+
+        usercols = ['segment_budget', 'segment_mainstream', 'segment_premium']
+        itemcols = ['price', 'category_books', 'category_clothing', 'category_electronics', 'category_home']
+
+        unique_users = log_pd['user_idx'].unique()
+        unique_items = log_pd['item_idx'].unique()
+        user_mapping = {uid: i for i, uid in enumerate(unique_users)}
+        item_mapping = {iid: i + len(unique_users) for i, iid in enumerate(unique_items)}
+        self.user_item_mapping = {'users': user_mapping, 'items': item_mapping}
+
+        num_nodes = len(unique_users) + len(unique_items)
+        num_user_feats = len(usercols)
+        num_item_feats = len(itemcols)
+
+        edge_index = []
+        pos_pairs = []
+        for _, row in log_pd.iterrows():
+            u = user_mapping[row['user_idx']]
+            i = item_mapping[row['item_idx']]
+            edge_index.append([u, i])
+            edge_index.append([i, u])
+            pos_pairs.append((u, i))
+
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous().to(self.device)
+
+        user_feat_tensor = torch.zeros(num_nodes, len(usercols), dtype=torch.long).to(self.device)
+        item_feat_tensor = torch.zeros(num_nodes, len(itemcols), dtype=torch.long).to(self.device)
+
+        for _, row in user_feat_pd.iterrows():
+            if row['user_idx'] in user_mapping:
+                user_feat_tensor[user_mapping[row['user_idx']]] = torch.from_numpy(row[usercols].values).long()
+
+        for _, row in item_feat_pd.iterrows():
+            if row['item_idx'] in item_mapping:
+                item_feat_tensor[item_mapping[row['item_idx']]] = torch.from_numpy(row[itemcols].values).long()
+
+        self.model = self.GATRec(
+            num_nodes=num_nodes,
+            user_feat_dim=num_user_feats,
+            item_feat_dim=num_item_feats,
+            embedding_dim=self.embedding_dim
+        ).to(self.device)
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.005)
+        sigmoid = nn.Sigmoid()
+
+        all_item_indices = list(self.user_item_mapping['items'].values())
+
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            optimizer.zero_grad()
+
+            out = self.model(edge_index, user_feat_tensor, item_feat_tensor)
+
+            loss = 0
+            for u, i in pos_pairs:
+                u_embed = out[u]
+                i_embed = out[i]
+
+                # Hard negative sampling: pick top-N scoring negatives for user u
+                with torch.no_grad():
+                    item_embeds = out[all_item_indices]  # all item embeddings
+                    scores = torch.matmul(u_embed, item_embeds.T)
+                    # Mask positive item
+                    scores[all_item_indices.index(i)] = -1e9
+                    # Top N hardest negatives
+                    N = 10
+                    top_neg_indices = torch.topk(scores, N).indices.cpu().numpy()
+                    j = random.choice(top_neg_indices)
+                    j_idx = all_item_indices[j]
+
+                j_embed = out[j_idx]
+
+                pos_score = torch.dot(u_embed, i_embed)
+                neg_score = torch.dot(u_embed, j_embed)
+
+                diff = pos_score - neg_score
+                diff = torch.clamp(diff, min=-10, max=10)
+
+                loss += -torch.log(sigmoid(diff) + 1e-8)
+
+            loss /= len(pos_pairs)
+            loss.backward()
+            optimizer.step()
+
+            print(f"Epoch {epoch+1}, BPR Loss: {loss.item():.4f}")
+
+        self.final_embeddings = out
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        if self.model is None:
+            raise ValueError("Model has not been trained. Call fit() before predict().")
+
+        self.model.eval()
+        recommendations = []
+        item_indices = {v: k for k, v in self.user_item_mapping['items'].items()}
+
+        with torch.no_grad():
+            for user in users.toPandas()['user_idx']:
+                if user not in self.user_item_mapping['users']:
+                    continue
+                user_idx = self.user_item_mapping['users'][user]
+                user_embedding = self.final_embeddings[user_idx]
+
+                item_scores = []
+                for item, idx in self.user_item_mapping['items'].items():
+                    item_embedding = self.final_embeddings[idx]
+                    score = torch.dot(user_embedding, item_embedding).item()
+                    item_scores.append((item, score))
+
+                item_scores = sorted(item_scores, key=lambda x: x[1], reverse=True)
+
+                if filter_seen_items:
+                    seen_items = set(
+                        log.filter(log.user_idx == user).toPandas()['item_idx'].tolist()
+                    )
+                    item_scores = [pair for pair in item_scores if pair[0] not in seen_items]
+
+                top_k = item_scores[:k]
+
+                for item_id, relevance in top_k:
+                    recommendations.append({
+                        "user_idx": user,
+                        "item_idx": item_id,
+                        "relevance": relevance
+                    })
+
+        rec_df = pd.DataFrame(recommendations)
+        recs = spark.createDataFrame(rec_df)
+        return recs
+
 # Cell: Data Exploration Functions
 """
 ## Data Exploration Functions
